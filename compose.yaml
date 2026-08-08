@@ -1,0 +1,61 @@
+name: fastapi-openai-agent-memory-platform
+
+services:
+  postgres:
+    image: ${MEMORY_POSTGRES_IMAGE:?Run make env-init first}
+    restart: unless-stopped
+    # Never published to the host or LAN; only the api service reaches it.
+    environment:
+      POSTGRES_USER: ${MEMORY_POSTGRES_USER:-memory_platform}
+      POSTGRES_PASSWORD: ${MEMORY_POSTGRES_PASSWORD:?Run make env-init first}
+      POSTGRES_DB: ${MEMORY_POSTGRES_DB:-memory_platform}
+    volumes:
+      - memory-postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${MEMORY_POSTGRES_USER:-memory_platform}:${MEMORY_POSTGRES_PASSWORD:?Run make env-init first}@postgres:5432/${MEMORY_POSTGRES_DB:-memory_platform}
+    ports:
+      - "${MEMORY_API_BIND_ADDRESS:-127.0.0.1}:${MEMORY_API_PORT:-8200}:8000"
+    volumes:
+      - ./config:/app/config:ro
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  backend:
+
+volumes:
+  memory-postgres-data:
+    name: homeai_fastapi_openai_agent_memory_platform_postgres_data

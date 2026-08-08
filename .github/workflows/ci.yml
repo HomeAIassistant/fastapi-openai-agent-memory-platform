@@ -1,0 +1,76 @@
+name: Memory Platform CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-platform-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run Ruff lint and format checks
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Verify application import and OpenAPI generation
+        run: |
+          MEMORY_API_TOKEN=ci-placeholder-token-0123456789abcdefABCDEF \
+          DATABASE_URL=postgresql://ci:ci@localhost/ci \
+          python -c "from app.api.factory import create_app; create_app().openapi()"
+
+      - name: Run the unit test suite (in-memory repository, no Docker needed)
+        run: pytest -q
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generate a disposable .env
+        run: |
+          cp .env.example .env
+          sed -i "s/^MEMORY_API_TOKEN=.*/MEMORY_API_TOKEN=$(openssl rand -hex 32)/" .env
+          sed -i "s/^MEMORY_POSTGRES_PASSWORD=.*/MEMORY_POSTGRES_PASSWORD=$(openssl rand -hex 24)/" .env
+          sed -i "s/^MEMORY_API_BIND_ADDRESS=.*/MEMORY_API_BIND_ADDRESS=127.0.0.1/" .env
+
+      - name: Build, start, and wait for postgres + api to become healthy
+        run: docker compose up -d --build --wait
+
+      - name: Verify /health and /ready
+        run: |
+          set -a; . .env; set +a
+          curl --fail --show-error "http://127.0.0.1:${MEMORY_API_PORT:-8200}/health"
+          curl --fail --show-error "http://127.0.0.1:${MEMORY_API_PORT:-8200}/ready"
+
+      - name: Verify container runs non-root with a read-only filesystem
+        run: |
+          test "$(docker compose exec -T api id -u)" = "10001"
+          ! docker compose exec -T api touch /should-fail
+
+      - name: Diagnostics
+        if: always()
+        run: docker compose ps && docker compose logs --tail=200
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down --volumes --remove-orphans

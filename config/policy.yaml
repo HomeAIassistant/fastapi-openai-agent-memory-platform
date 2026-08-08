@@ -1,0 +1,29 @@
+# Deterministic write policy for long-term agent memory.
+#
+# `type` and `sensitivity` are validated against this file, not a hardcoded
+# enum, so new memory types or sensitivity tiers require a reviewed change
+# here rather than a code change. See AGENTS.md.
+
+long_term:
+  write:
+    # Memory types a caller may propose. Anything else is rejected with 422.
+    allowed_types:
+      - preference
+      - fact
+      - decision
+      - workflow_lesson
+
+    # Sensitivity tiers a caller may declare. Anything else is rejected with 422.
+    allowed_sensitivities:
+      - public
+      - internal
+      - sensitive
+      - identity
+      - security
+
+    # Sensitivity tiers stored as write_status=pending_approval instead of
+    # approved, and excluded from search results until approved.
+    require_approval:
+      - sensitive
+      - identity
+      - security
