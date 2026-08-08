@@ -9,10 +9,23 @@ which backend produced a vector.
 from __future__ import annotations
 
 import hashlib
+import logging
 import struct
 from typing import Protocol
 
 import httpx
+
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingProviderError(RuntimeError):
+    """Raised when an embedding backend cannot produce a vector.
+
+    The message is a safe, generic diagnostic; the real cause (network
+    error, HTTP status, malformed response) is chained (`raise ... from
+    exc`) and logged server-side, not returned to callers, since it may
+    otherwise expose upstream provider internals.
+    """
 
 
 class EmbeddingProvider(Protocol):
@@ -21,7 +34,11 @@ class EmbeddingProvider(Protocol):
     dimensions: int
 
     def embed(self, text: str) -> list[float]:
-        """Return a `dimensions`-length vector for the given text."""
+        """Return a `dimensions`-length vector for the given text.
+
+        Raises:
+            EmbeddingProviderError: If the backend could not produce a vector.
+        """
         ...
 
 
@@ -73,11 +90,32 @@ class OpenAIEmbeddingProvider:
     def embed(self, text: str) -> list[float]:
         """Call the OpenAI embeddings API and return the resulting vector."""
 
-        response = self._client.post(
-            "/embeddings",
-            json={"model": self._model, "input": text, "dimensions": self.dimensions},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        embedding: list[float] = payload["data"][0]["embedding"]
+        try:
+            response = self._client.post(
+                "/embeddings",
+                json={
+                    "model": self._model,
+                    "input": text,
+                    "dimensions": self.dimensions,
+                },
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            # Covers both connection/timeout failures (httpx.RequestError)
+            # and non-2xx responses (httpx.HTTPStatusError from raise_for_status).
+            logger.exception("OpenAI embeddings request failed")
+            raise EmbeddingProviderError(
+                "the embedding provider is temporarily unavailable"
+            ) from exc
+
+        try:
+            payload = response.json()
+            embedding: list[float] = payload["data"][0]["embedding"]
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            # ValueError covers a non-JSON body; the rest cover a JSON body
+            # that doesn't match the expected embeddings response shape.
+            logger.exception("OpenAI embeddings response was malformed")
+            raise EmbeddingProviderError(
+                "the embedding provider returned an unexpected response"
+            ) from exc
         return embedding

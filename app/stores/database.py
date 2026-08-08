@@ -8,6 +8,7 @@ the API or policy layers, and so unit tests can run against
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -16,6 +17,19 @@ import psycopg
 from psycopg.rows import dict_row
 
 from ..memory.models import MemoryProvenance, MemoryRecord, MemoryScope
+
+logger = logging.getLogger(__name__)
+
+
+class MemoryRepositoryError(RuntimeError):
+    """Raised when a storage operation fails.
+
+    The message is always a safe, generic diagnostic; it never includes the
+    connection string, query text, or the underlying driver exception text,
+    since psycopg error messages can echo back connection parameters. The
+    real exception is chained (`raise ... from exc`) and logged server-side
+    for operators, not returned to callers.
+    """
 
 
 def schema_sql(dimensions: int) -> str:
@@ -63,6 +77,8 @@ def _vector_literal(embedding: list[float]) -> str:
 
 
 def _row_to_record(row: dict[str, Any]) -> MemoryRecord:
+    """Map one `memories` row (as returned by `dict_row`) to a `MemoryRecord`."""
+
     return MemoryRecord(
         memory_id=row["memory_id"],
         type=row["type"],
@@ -88,24 +104,41 @@ def _row_to_record(row: dict[str, Any]) -> MemoryRecord:
 
 
 class MemoryRepository(Protocol):
-    """Storage boundary for long-term memory records."""
+    """Storage boundary for long-term memory records.
+
+    `initialize`, `create`, `get`, and `search` raise `MemoryRepositoryError`
+    on a storage failure; `health` never raises and instead returns `False`,
+    since it exists specifically to be safe to call from `/ready`.
+    """
 
     def initialize(self) -> None:
-        """Apply the idempotent service schema."""
+        """Apply the idempotent service schema.
+
+        Raises:
+            MemoryRepositoryError: If the schema could not be applied.
+        """
         ...
 
     def health(self) -> bool:
-        """Verify a minimal round trip to the backing store."""
+        """Verify a minimal round trip to the backing store; never raises."""
         ...
 
     def create(self, record: MemoryRecord, *, embedding: list[float]) -> None:
-        """Durably store one already-validated, policy-resolved record."""
+        """Durably store one already-validated, policy-resolved record.
+
+        Raises:
+            MemoryRepositoryError: If the record could not be stored.
+        """
         ...
 
     def get(
         self, memory_id: str, *, tenant_id: str, project_id: str
     ) -> MemoryRecord | None:
-        """Fetch one record, scoped to the caller's tenant/project."""
+        """Fetch one record, scoped to the caller's tenant/project.
+
+        Raises:
+            MemoryRepositoryError: If the lookup could not be performed.
+        """
         ...
 
     def search(
@@ -117,8 +150,19 @@ class MemoryRepository(Protocol):
         types: list[str] | None,
         include_pending: bool,
     ) -> list[tuple[MemoryRecord, float]]:
-        """Return the top-k records in scope ranked by descending similarity."""
+        """Return the top-k records in scope ranked by descending similarity.
+
+        Raises:
+            MemoryRepositoryError: If the search could not be performed.
+        """
         ...
+
+
+#: Bounds how long a connection attempt or a single statement may take, so a
+#: down/unresponsive Postgres produces a MemoryRepositoryError (via /ready or
+#: a 503) within seconds instead of hanging the request indefinitely.
+_CONNECT_TIMEOUT_SECONDS = 5
+_STATEMENT_TIMEOUT_MS = 10_000
 
 
 class PostgresMemoryRepository:
@@ -131,70 +175,98 @@ class PostgresMemoryRepository:
         self._dimensions = dimensions
 
     def _connect(self) -> psycopg.Connection[dict[str, Any]]:
-        return psycopg.connect(self._database_url, row_factory=dict_row)
+        return psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+            connect_timeout=_CONNECT_TIMEOUT_SECONDS,
+            options=f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
+        )
 
     def initialize(self) -> None:
         """Apply the idempotent service schema."""
 
-        with self._connect() as connection:
-            connection.execute(schema_sql(self._dimensions))
+        try:
+            with self._connect() as connection:
+                connection.execute(schema_sql(self._dimensions))
+        except psycopg.Error as exc:
+            logger.exception("Failed to apply the memory service schema")
+            raise MemoryRepositoryError(
+                "failed to apply the memory database schema; "
+                "check that Postgres is reachable and the pgvector "
+                "extension is installable"
+            ) from exc
 
     def health(self) -> bool:
-        """Verify a minimal database round trip."""
+        """Verify a minimal database round trip; never raises."""
 
         try:
             with self._connect() as connection:
                 return connection.execute("SELECT 1 AS ready").fetchone() == {
                     "ready": 1
                 }
-        except psycopg.Error:
+        except psycopg.Error as exc:
+            # Deliberately swallowed: /ready must report `False`, not 500.
+            logger.warning("Database health check failed: %s", exc)
             return False
 
     def create(self, record: MemoryRecord, *, embedding: list[float]) -> None:
         """Insert one record, casting its embedding to `vector` server-side."""
 
-        with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO memories (
-                     memory_id, type, tenant_id, project_id, user_id, agent_id,
-                     content, source_type, run_id, source_id, confidence,
-                     created_at, expires_at, supersedes, sensitivity,
-                     write_status, embedding
-                   ) VALUES (
-                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector
-                   )""",
-                (
-                    record.memory_id,
-                    record.type,
-                    record.scope.tenant_id,
-                    record.scope.project_id,
-                    record.scope.user_id,
-                    record.scope.agent_id,
-                    record.content,
-                    record.provenance.source_type,
-                    record.provenance.run_id,
-                    record.provenance.source_id,
-                    record.confidence,
-                    record.created_at,
-                    record.expires_at,
-                    record.supersedes,
-                    record.sensitivity,
-                    record.write_status,
-                    _vector_literal(embedding),
-                ),
-            )
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """INSERT INTO memories (
+                         memory_id, type, tenant_id, project_id, user_id, agent_id,
+                         content, source_type, run_id, source_id, confidence,
+                         created_at, expires_at, supersedes, sensitivity,
+                         write_status, embedding
+                       ) VALUES (
+                         %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector
+                       )""",
+                    (
+                        record.memory_id,
+                        record.type,
+                        record.scope.tenant_id,
+                        record.scope.project_id,
+                        record.scope.user_id,
+                        record.scope.agent_id,
+                        record.content,
+                        record.provenance.source_type,
+                        record.provenance.run_id,
+                        record.provenance.source_id,
+                        record.confidence,
+                        record.created_at,
+                        record.expires_at,
+                        record.supersedes,
+                        record.sensitivity,
+                        record.write_status,
+                        _vector_literal(embedding),
+                    ),
+                )
+        except psycopg.Error as exc:
+            logger.exception("Failed to store memory %s", record.memory_id)
+            raise MemoryRepositoryError(
+                "failed to store the memory; the database may be unavailable "
+                "or the record may violate a storage constraint"
+            ) from exc
 
     def get(
         self, memory_id: str, *, tenant_id: str, project_id: str
     ) -> MemoryRecord | None:
         """Fetch one record, scoped to the caller's tenant/project."""
 
-        with self._connect() as connection:
-            row = connection.execute(
-                """SELECT * FROM memories
-                   WHERE memory_id=%s AND tenant_id=%s AND project_id=%s""",
-                (memory_id, tenant_id, project_id),
-            ).fetchone()
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """SELECT * FROM memories
+                       WHERE memory_id=%s AND tenant_id=%s AND project_id=%s""",
+                    (memory_id, tenant_id, project_id),
+                ).fetchone()
+        except psycopg.Error as exc:
+            logger.exception("Failed to fetch memory %s", memory_id)
+            raise MemoryRepositoryError(
+                "failed to fetch the memory; the database may be unavailable"
+            ) from exc
         return _row_to_record(row) if row is not None else None
 
     def search(
@@ -208,6 +280,9 @@ class PostgresMemoryRepository:
     ) -> list[tuple[MemoryRecord, float]]:
         """Rank scoped, non-expired records by ascending pgvector cosine distance."""
 
+        # `clauses` only ever contains fixed column-comparison strings chosen
+        # by this method (never caller-supplied text); every actual value,
+        # including `types`, is passed through `params` and bound with `%s`.
         clauses = ["tenant_id=%s", "project_id=%s"]
         params: list[Any] = [scope.tenant_id, scope.project_id]
         if scope.user_id is not None:
@@ -231,10 +306,19 @@ class PostgresMemoryRepository:
             ORDER BY embedding <=> %s::vector ASC
             LIMIT %s
         """
-        with self._connect() as connection:
-            rows = connection.execute(
-                sql, [query_vector, *params, query_vector, top_k]
-            ).fetchall()
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    sql, [query_vector, *params, query_vector, top_k]
+                ).fetchall()
+        except psycopg.Error as exc:
+            logger.exception("Failed to search memories")
+            raise MemoryRepositoryError(
+                "failed to search memories; the database may be unavailable"
+            ) from exc
+        # pgvector's `<=>` is cosine *distance* in [0, 2]; convert to a
+        # similarity score so higher is better, matching the in-memory
+        # repository and the public API contract.
         return [(_row_to_record(row), 1.0 - row["distance"]) for row in rows]
 
 
@@ -308,6 +392,13 @@ class InMemoryMemoryRepository:
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    """Return cosine similarity in [-1, 1]; 0.0 for a degenerate zero vector.
+
+    Mirrors `1.0 - cosine_distance` from pgvector's `<=>` operator so
+    `InMemoryMemoryRepository.search` ranks identically to the Postgres
+    implementation.
+    """
+
     dot = sum(a * b for a, b in zip(left, right, strict=True))
     left_norm = math.sqrt(sum(a * a for a in left))
     right_norm = math.sqrt(sum(b * b for b in right))

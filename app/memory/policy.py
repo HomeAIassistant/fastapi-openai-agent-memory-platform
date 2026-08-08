@@ -50,7 +50,17 @@ def load_write_policy(path: Path) -> WritePolicy:
 
     if not path.is_file():
         raise PolicyConfigError(f"policy file not found: {path}")
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PolicyConfigError(f"unable to read policy file: {path}") from exc
+
+    try:
+        raw = yaml.safe_load(raw_text) or {}
+    except yaml.YAMLError as exc:
+        raise PolicyConfigError(f"invalid YAML in policy file: {path}") from exc
+
     try:
         write = raw["long_term"]["write"]
         allowed_types = frozenset(write["allowed_types"])
