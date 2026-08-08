@@ -35,6 +35,19 @@ own runtime/control state, conversation/session memory, or document parsing.
 - Treat the root `Makefile` as the authoritative local and CI command
   interface.
 - Never commit `.env`, environment backups, database credentials, or API keys.
+- Give every module and public function a docstring, and catch every
+  external I/O call (Postgres, an embedding provider's HTTP request) with a
+  safe, generic error message — never return a raw driver/HTTP exception to
+  a caller, since it can echo back connection strings or upstream details.
+  Log the real exception server-side instead (see `docs/architecture.md`'s
+  error-handling model).
+- Keep `docs/` synchronized with the code in the same change: a new/changed
+  endpoint or error path updates `docs/api-examples.md` (and
+  `docs/troubleshooting.md` for a new error path), a new Make target updates
+  `docs/make-commands.md`, a structural change updates
+  `docs/architecture.md`, and a phase-status change updates `docs/overview.md`
+  and `README.md`. See `docs/README.md` for the full index and source-of-truth
+  order.
 
 ## Current phase
 
@@ -43,4 +56,5 @@ Postgres + pgvector, auth, scoped memory schema, policy-gated deterministic
 write API, vector search API) per the phased plan in `plan.md` at the
 repository root. Deduplication, supersession, expiration sweeps,
 hybrid/reranked retrieval, citations, and autonomous memory generation
-(Phases C-F) are not yet implemented.
+(Phases C-F) are not yet implemented. See `docs/overview.md` for the current
+detailed status.

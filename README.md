@@ -106,3 +106,15 @@ See `app/memory/policy.py` and `config/policy.yaml` for the write policy, and
 `app/stores/database.py` for the `MemoryRepository` interface (Postgres and
 in-memory implementations) and `app/stores/embeddings.py` for the
 `EmbeddingProvider` interface.
+
+## Documentation
+
+| Document | Read this for |
+| --- | --- |
+| [`docs/overview.md`](docs/overview.md) | What this service is, where it fits in the platform, current phase, what's not built yet. Start here. |
+| [`docs/architecture.md`](docs/architecture.md) | Request flow, the memory record contract, database schema, policy model, error-handling model, security notes. |
+| [`docs/instructions.md`](docs/instructions.md) | Setup, local development, deployment, adding a memory type, credential rotation. |
+| [`docs/api-examples.md`](docs/api-examples.md) | curl examples for every endpoint, including error responses. |
+| [`docs/make-commands.md`](docs/make-commands.md) | Every `Makefile` target. |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | HTTP error reference and diagnosis steps. |
+| [`docs/README.md`](docs/README.md) | Full documentation index. |

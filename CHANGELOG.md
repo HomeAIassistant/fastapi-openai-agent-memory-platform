@@ -32,3 +32,16 @@
   `code`/`message` body instead of an unhandled `500`.
 - `load_write_policy` now raises `PolicyConfigError` with a clear message on
   an unreadable file or invalid YAML instead of an unhandled exception.
+
+### Documentation
+
+- Added `docs/overview.md` (what/why/current phase), `docs/architecture.md`
+  (request flow, memory record contract, database schema, policy model,
+  error-handling model, security notes), `docs/instructions.md`
+  (setup/development/deployment/operations), `docs/make-commands.md`
+  (Makefile reference), `docs/troubleshooting.md` (HTTP error reference and
+  diagnosis steps), and `docs/README.md` (documentation index).
+- Expanded `docs/api-examples.md` with 404/401/503 examples and a
+  status-code reference table.
+- Cross-linked all documentation from `README.md` and added a doc-sync
+  convention to `AGENTS.md`.

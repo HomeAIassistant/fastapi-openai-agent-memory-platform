@@ -55,6 +55,15 @@ curl -sS "$BASE/memories" \
 curl -sS "$BASE/memories/mem_...?tenant_id=home&project_id=henley" -H "$AUTH"
 ```
 
+A wrong scope or an unknown id both return the same `404` (see
+`docs/architecture.md` for why):
+
+```bash
+curl -sS -w "\n%{http_code}\n" \
+  "$BASE/memories/mem_does_not_exist?tenant_id=home&project_id=henley" -H "$AUTH"
+# -> 404 {"detail": {"code": "not_found", "message": "..."}}
+```
+
 ## Search
 
 ```bash
@@ -80,6 +89,26 @@ curl -sS "$BASE/memories/search" \
   }'
 ```
 
+## Missing or bad auth
+
+```bash
+curl -sS -w "\n%{http_code}\n" "$BASE/memories" -X POST -d '{}'
+# -> 401 {"detail": {"code": "unauthorized", "message": "Invalid bearer token."}}
+```
+
+## Error responses
+
+| Status | `code` | When |
+| --- | --- | --- |
+| `401` | `unauthorized` | Missing/wrong bearer token |
+| `404` | `not_found` | Unknown `memory_id`, or right id but wrong scope |
+| `422` | `policy_rejected` | `type`/`sensitivity` not allowed by `config/policy.yaml` |
+| `422` | *(none)* | Request body failed schema validation (e.g. `confidence` out of `0.0-1.0`) |
+| `503` | `storage_unavailable` | Postgres unreachable or a query failed |
+| `503` | `embedding_unavailable` | Embedding provider unreachable or returned a bad response |
+
+Full explanations and how to diagnose each one: `docs/troubleshooting.md`.
+
 ## Notes
 
 - `MEMORY_EMBEDDING_PROVIDER=deterministic` (the default) produces a hashed,
@@ -88,3 +117,6 @@ curl -sS "$BASE/memories/search" \
   `OPENAI_API_KEY` for real semantic search.
 - Every read/write is scoped by `tenant_id`/`project_id` (and optionally
   `user_id`/`agent_id`); there is no cross-scope query.
+- `503` messages are intentionally generic; the real cause is in the server
+  logs (`make logs`), never in the response body — see
+  `docs/troubleshooting.md`.
