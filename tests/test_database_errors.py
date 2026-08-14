@@ -6,9 +6,11 @@ required) while still exercising the real `psycopg.Error` handling path.
 
 from datetime import UTC, datetime
 
+import psycopg
 import pytest
 
 from app.memory.models import MemoryProvenance, MemoryRecord, MemoryScope
+from app.stores import database
 from app.stores.database import MemoryRepositoryError, PostgresMemoryRepository
 
 UNREACHABLE_DSN = "postgresql://baduser:secret-password@127.0.0.1:1/nonexistent"
@@ -71,3 +73,40 @@ def test_health_returns_false_instead_of_raising(
     repository: PostgresMemoryRepository,
 ) -> None:
     assert repository.health() is False
+
+
+def test_initialize_uses_the_longer_schema_statement_timeout(
+    repository: PostgresMemoryRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`initialize()`'s CREATE INDEX ... USING hnsw must not share the 10s
+    per-request timeout: on a large table an index build/rebuild can
+    legitimately take longer than that, and canceling it would fail every
+    future startup (see CHANGELOG.md)."""
+
+    captured: dict[str, object] = {}
+
+    def fake_connect(*args: object, **kwargs: object) -> psycopg.Connection:
+        captured.update(kwargs)
+        raise psycopg.OperationalError("boom")
+
+    monkeypatch.setattr(database.psycopg, "connect", fake_connect)
+
+    with pytest.raises(MemoryRepositoryError):
+        repository.initialize()
+    assert captured["options"] == "-c statement_timeout=300000"
+
+
+def test_create_uses_the_ordinary_per_request_statement_timeout(
+    repository: PostgresMemoryRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_connect(*args: object, **kwargs: object) -> psycopg.Connection:
+        captured.update(kwargs)
+        raise psycopg.OperationalError("boom")
+
+    monkeypatch.setattr(database.psycopg, "connect", fake_connect)
+
+    with pytest.raises(MemoryRepositoryError):
+        repository.create(_sample_record(), embedding=[0.1] * 8)
+    assert captured["options"] == "-c statement_timeout=10000"
