@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -158,11 +160,22 @@ class MemoryRepository(Protocol):
         ...
 
 
-#: Bounds how long a connection attempt or a single statement may take, so a
-#: down/unresponsive Postgres produces a MemoryRepositoryError (via /ready or
-#: a 503) within seconds instead of hanging the request indefinitely.
+#: Bounds how long a connection attempt or a per-request statement may take,
+#: so a down/unresponsive Postgres fails a write/read/search within seconds
+#: (as a MemoryRepositoryError, translated to a 503) instead of hanging the
+#: request indefinitely. `/ready` is unaffected by this doc note: it calls
+#: `health()`, which catches `psycopg.Error` itself and returns `False`
+#: rather than raising.
 _CONNECT_TIMEOUT_SECONDS = 5
 _STATEMENT_TIMEOUT_MS = 10_000
+
+#: `initialize()` runs `CREATE INDEX ... USING hnsw`, which — unlike a
+#: per-request query — can legitimately take much longer than
+#: `_STATEMENT_TIMEOUT_MS` once the table holds many rows (first startup
+#: against an existing large table, or a rebuild after a pgvector
+#: upgrade/restore). It still needs a bound so a truly stuck statement
+#: doesn't hang startup forever, just a much more generous one.
+_SCHEMA_STATEMENT_TIMEOUT_MS = 300_000
 
 
 class PostgresMemoryRepository:
@@ -174,27 +187,52 @@ class PostgresMemoryRepository:
         self._database_url = database_url
         self._dimensions = dimensions
 
-    def _connect(self) -> psycopg.Connection[dict[str, Any]]:
+    def _connect(
+        self, *, statement_timeout_ms: int = _STATEMENT_TIMEOUT_MS
+    ) -> psycopg.Connection[dict[str, Any]]:
         return psycopg.connect(
             self._database_url,
             row_factory=dict_row,
             connect_timeout=_CONNECT_TIMEOUT_SECONDS,
-            options=f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
+            options=f"-c statement_timeout={statement_timeout_ms}",
         )
+
+    @contextmanager
+    def _operation(
+        self,
+        *,
+        log_message: str,
+        error_message: str,
+        log_args: tuple[object, ...] = (),
+        statement_timeout_ms: int = _STATEMENT_TIMEOUT_MS,
+    ) -> Iterator[psycopg.Connection[dict[str, Any]]]:
+        """Yield a connection; translate any `psycopg.Error` into `MemoryRepositoryError`.
+
+        Centralizes the connect/except/log/raise pattern every operation
+        below needs, so a new method can't accidentally skip it and leak a
+        raw driver exception to a caller.
+        """
+
+        try:
+            with self._connect(statement_timeout_ms=statement_timeout_ms) as connection:
+                yield connection
+        except psycopg.Error as exc:
+            logger.exception(log_message, *log_args)
+            raise MemoryRepositoryError(error_message) from exc
 
     def initialize(self) -> None:
         """Apply the idempotent service schema."""
 
-        try:
-            with self._connect() as connection:
-                connection.execute(schema_sql(self._dimensions))
-        except psycopg.Error as exc:
-            logger.exception("Failed to apply the memory service schema")
-            raise MemoryRepositoryError(
+        with self._operation(
+            log_message="Failed to apply the memory service schema",
+            error_message=(
                 "failed to apply the memory database schema; "
                 "check that Postgres is reachable and the pgvector "
                 "extension is installable"
-            ) from exc
+            ),
+            statement_timeout_ms=_SCHEMA_STATEMENT_TIMEOUT_MS,
+        ) as connection:
+            connection.execute(schema_sql(self._dimensions))
 
     def health(self) -> bool:
         """Verify a minimal database round trip; never raises."""
@@ -212,61 +250,59 @@ class PostgresMemoryRepository:
     def create(self, record: MemoryRecord, *, embedding: list[float]) -> None:
         """Insert one record, casting its embedding to `vector` server-side."""
 
-        try:
-            with self._connect() as connection:
-                connection.execute(
-                    """INSERT INTO memories (
-                         memory_id, type, tenant_id, project_id, user_id, agent_id,
-                         content, source_type, run_id, source_id, confidence,
-                         created_at, expires_at, supersedes, sensitivity,
-                         write_status, embedding
-                       ) VALUES (
-                         %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector
-                       )""",
-                    (
-                        record.memory_id,
-                        record.type,
-                        record.scope.tenant_id,
-                        record.scope.project_id,
-                        record.scope.user_id,
-                        record.scope.agent_id,
-                        record.content,
-                        record.provenance.source_type,
-                        record.provenance.run_id,
-                        record.provenance.source_id,
-                        record.confidence,
-                        record.created_at,
-                        record.expires_at,
-                        record.supersedes,
-                        record.sensitivity,
-                        record.write_status,
-                        _vector_literal(embedding),
-                    ),
-                )
-        except psycopg.Error as exc:
-            logger.exception("Failed to store memory %s", record.memory_id)
-            raise MemoryRepositoryError(
+        with self._operation(
+            log_message="Failed to store memory %s",
+            log_args=(record.memory_id,),
+            error_message=(
                 "failed to store the memory; the database may be unavailable "
                 "or the record may violate a storage constraint"
-            ) from exc
+            ),
+        ) as connection:
+            connection.execute(
+                """INSERT INTO memories (
+                     memory_id, type, tenant_id, project_id, user_id, agent_id,
+                     content, source_type, run_id, source_id, confidence,
+                     created_at, expires_at, supersedes, sensitivity,
+                     write_status, embedding
+                   ) VALUES (
+                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector
+                   )""",
+                (
+                    record.memory_id,
+                    record.type,
+                    record.scope.tenant_id,
+                    record.scope.project_id,
+                    record.scope.user_id,
+                    record.scope.agent_id,
+                    record.content,
+                    record.provenance.source_type,
+                    record.provenance.run_id,
+                    record.provenance.source_id,
+                    record.confidence,
+                    record.created_at,
+                    record.expires_at,
+                    record.supersedes,
+                    record.sensitivity,
+                    record.write_status,
+                    _vector_literal(embedding),
+                ),
+            )
 
     def get(
         self, memory_id: str, *, tenant_id: str, project_id: str
     ) -> MemoryRecord | None:
         """Fetch one record, scoped to the caller's tenant/project."""
 
-        try:
-            with self._connect() as connection:
-                row = connection.execute(
-                    """SELECT * FROM memories
-                       WHERE memory_id=%s AND tenant_id=%s AND project_id=%s""",
-                    (memory_id, tenant_id, project_id),
-                ).fetchone()
-        except psycopg.Error as exc:
-            logger.exception("Failed to fetch memory %s", memory_id)
-            raise MemoryRepositoryError(
-                "failed to fetch the memory; the database may be unavailable"
-            ) from exc
+        with self._operation(
+            log_message="Failed to fetch memory %s",
+            log_args=(memory_id,),
+            error_message="failed to fetch the memory; the database may be unavailable",
+        ) as connection:
+            row = connection.execute(
+                """SELECT * FROM memories
+                   WHERE memory_id=%s AND tenant_id=%s AND project_id=%s""",
+                (memory_id, tenant_id, project_id),
+            ).fetchone()
         return _row_to_record(row) if row is not None else None
 
     def search(
@@ -306,16 +342,13 @@ class PostgresMemoryRepository:
             ORDER BY embedding <=> %s::vector ASC
             LIMIT %s
         """
-        try:
-            with self._connect() as connection:
-                rows = connection.execute(
-                    sql, [query_vector, *params, query_vector, top_k]
-                ).fetchall()
-        except psycopg.Error as exc:
-            logger.exception("Failed to search memories")
-            raise MemoryRepositoryError(
-                "failed to search memories; the database may be unavailable"
-            ) from exc
+        with self._operation(
+            log_message="Failed to search memories",
+            error_message="failed to search memories; the database may be unavailable",
+        ) as connection:
+            rows = connection.execute(
+                sql, [query_vector, *params, query_vector, top_k]
+            ).fetchall()
         # pgvector's `<=>` is cosine *distance* in [0, 2]; convert to a
         # similarity score so higher is better, matching the in-memory
         # repository and the public API contract.

@@ -2,10 +2,11 @@
 
 Every route here requires the configured bearer token. Writes go through
 `propose_memory` (validate -> policy -> embed -> store); there is no
-unrestricted write path. Storage and embedding-provider failures are mapped
-to `503` with a safe, generic message; the underlying exception (which may
-otherwise reveal database or provider internals) is logged server-side by
-the store/provider that raised it, not echoed back to the caller.
+unrestricted write path. `MemoryValidationError`, `EmbeddingProviderError`,
+and `MemoryRepositoryError` are not caught here: they are translated into
+safe `422`/`503` responses by the app-wide handlers in
+`app/api/error_handlers.py`, so every current and future route gets that
+translation automatically instead of needing to repeat it.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,19 +18,13 @@ from ...memory.models import (
     MemorySearchResult,
 )
 from ...memory.policy import WritePolicy
-from ...memory.writer import MemoryValidationError, propose_memory
+from ...memory.writer import propose_memory
 from ...security.auth import authorize
-from ...stores.database import MemoryRepository, MemoryRepositoryError
-from ...stores.embeddings import EmbeddingProvider, EmbeddingProviderError
+from ...stores.database import MemoryRepository
+from ...stores.embeddings import EmbeddingProvider
 from ..dependencies import get_embeddings, get_policy, get_repository
 
 router = APIRouter(dependencies=[Depends(authorize)], tags=["memories"])
-
-
-def _service_unavailable(code: str, exc: Exception) -> HTTPException:
-    """Build a 503 response carrying the safe message from a domain error."""
-
-    return HTTPException(status_code=503, detail={"code": code, "message": str(exc)})
 
 
 @router.post("/memories", response_model=MemoryRecord, status_code=201)
@@ -41,18 +36,9 @@ def create_memory(
 ) -> MemoryRecord:
     """Validate, policy-check, embed, and store one proposed memory."""
 
-    try:
-        return propose_memory(
-            payload, policy=policy, repository=repository, embeddings=embeddings
-        )
-    except MemoryValidationError as exc:
-        raise HTTPException(
-            status_code=422, detail={"code": "policy_rejected", "message": str(exc)}
-        ) from exc
-    except EmbeddingProviderError as exc:
-        raise _service_unavailable("embedding_unavailable", exc) from exc
-    except MemoryRepositoryError as exc:
-        raise _service_unavailable("storage_unavailable", exc) from exc
+    return propose_memory(
+        payload, policy=policy, repository=repository, embeddings=embeddings
+    )
 
 
 @router.get("/memories/{memory_id}", response_model=MemoryRecord)
@@ -64,10 +50,7 @@ def get_memory(
 ) -> MemoryRecord:
     """Fetch one memory, scoped to the caller's tenant/project."""
 
-    try:
-        record = repository.get(memory_id, tenant_id=tenant_id, project_id=project_id)
-    except MemoryRepositoryError as exc:
-        raise _service_unavailable("storage_unavailable", exc) from exc
+    record = repository.get(memory_id, tenant_id=tenant_id, project_id=project_id)
     if record is None:
         raise HTTPException(
             status_code=404,
@@ -84,19 +67,12 @@ def search_memories(
 ) -> list[MemorySearchResult]:
     """Embed the query and return the top-k scoped results by similarity."""
 
-    try:
-        query_embedding = embeddings.embed(payload.query)
-    except EmbeddingProviderError as exc:
-        raise _service_unavailable("embedding_unavailable", exc) from exc
-
-    try:
-        hits = repository.search(
-            scope=payload.scope,
-            query_embedding=query_embedding,
-            top_k=payload.top_k,
-            types=payload.types,
-            include_pending=payload.include_pending,
-        )
-    except MemoryRepositoryError as exc:
-        raise _service_unavailable("storage_unavailable", exc) from exc
+    query_embedding = embeddings.embed(payload.query)
+    hits = repository.search(
+        scope=payload.scope,
+        query_embedding=query_embedding,
+        top_k=payload.top_k,
+        types=payload.types,
+        include_pending=payload.include_pending,
+    )
     return [MemorySearchResult(memory=record, score=score) for record, score in hits]

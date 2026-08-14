@@ -2,6 +2,35 @@
 
 ## Unreleased — 0.1.0
 
+### Fixed
+
+- `initialize()` (which runs `CREATE INDEX ... USING hnsw`) no longer shares
+  the 10s per-request `statement_timeout`; schema application now uses its
+  own 300s timeout, since an index build can legitimately take longer than
+  a per-request query once the table holds many rows — otherwise the service
+  could fail to start on every restart once data grew past that bound.
+- Centralized `MemoryValidationError`/`EmbeddingProviderError`/
+  `MemoryRepositoryError` -> HTTP translation into app-wide exception
+  handlers (`app/api/error_handlers.py`) instead of per-route `try`/`except`,
+  so a new route cannot forget the translation and leak a raw driver/HTTP
+  exception. Response bodies are unchanged.
+- Deduplicated the connect/except/log/raise pattern in
+  `PostgresMemoryRepository` behind one `_operation` helper
+  (`app/stores/database.py`) instead of repeating it in `initialize`,
+  `create`, `get`, and `search`.
+- Corrected a misleading comment implying `/ready` raises
+  `MemoryRepositoryError`; `health()` catches its own errors and returns
+  `False` instead.
+
+### Dependencies
+
+- Bumped `fastapi` 0.139.2 -> 0.141.1, `psycopg` 3.2.10 -> 3.3.4, `uvicorn`
+  0.51.0 -> 0.52.1, `actions/setup-python` v5 -> v7, and the Dockerfile base
+  image `python:3.13-slim-bookworm` -> `python:3.14-slim-bookworm` (digest
+  updated with the tag). Verified with the full unit suite, a Docker build,
+  and a live Compose deployment (health/ready, non-root/read-only-fs checks,
+  and a real memory write + search round trip against Postgres/pgvector).
+
 ### Added
 
 - Initial Phase B service skeleton: FastAPI application factory, bearer

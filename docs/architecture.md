@@ -200,13 +200,22 @@ generic and safe — the real driver/HTTP exception is logged server-side
 (`logger.exception(...)`) and chained (`raise ... from exc`) for local
 tracebacks, but never included in the message returned to callers. This
 matters because raw psycopg/httpx exception text can otherwise echo back
-connection or upstream details.
+connection or upstream details. `MemoryValidationError`,
+`EmbeddingProviderError`, and `MemoryRepositoryError` are translated to
+their HTTP response by app-wide handlers
+(`app/api/error_handlers.py:register_error_handlers`), not by per-route
+`try`/`except`, so a new route that calls the repository or an embedding
+provider gets this translation automatically.
 
-Postgres connections use a bounded `connect_timeout` (5s) and
-`statement_timeout` (10s) (`app/stores/database.py`). Without these, a down
-or unresponsive Postgres hangs a request indefinitely instead of failing
-into the `503` path above — this was an actual bug caught by testing against
-the real Compose deployment; see `docs/troubleshooting.md`.
+Postgres connections use a bounded `connect_timeout` (5s) and, for ordinary
+requests, a `statement_timeout` of 10s (`app/stores/database.py`). Without
+these, a down or unresponsive Postgres hangs a request indefinitely instead
+of failing into the `503` path above — this was an actual bug caught by
+testing against the real Compose deployment; see `docs/troubleshooting.md`.
+Schema application (`initialize()`, which includes `CREATE INDEX ... USING
+hnsw`) uses a separate, longer 300s `statement_timeout`, since an index
+build can legitimately take much longer than a per-request query once the
+table holds many rows.
 
 `/ready` never raises: `MemoryRepository.health()` catches its own errors
 and returns `False`, so a database outage shows up as `503 {"status":

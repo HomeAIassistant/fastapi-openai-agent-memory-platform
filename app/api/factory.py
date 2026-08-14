@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ..core.lifecycle import lifespan
 from ..core.settings import Settings, get_settings
+from .error_handlers import register_error_handlers
 from .routes import memories, system
 
 
@@ -24,6 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     application.state.settings = current
+    register_error_handlers(application)
 
     if current.parsed_cors_origins:
         application.add_middleware(
