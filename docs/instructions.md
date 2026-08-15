@@ -8,7 +8,7 @@ For *why* things are structured this way, see `docs/overview.md` and
 
 - Docker Engine and Docker Compose v2 (required for `make up` and anything
   that touches Postgres).
-- Python 3.13 and a virtual environment, only for host-side linting/tests
+- Python 3.14 and a virtual environment, only for host-side linting/tests
   (`make style-check`, `make unit` run against a `.venv` if one is active).
 - `openssl`, `curl` (used by `make env-init` / `make health`).
 - Git, with push access to

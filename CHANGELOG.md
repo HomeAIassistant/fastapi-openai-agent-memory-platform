@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- CI's `validate` job and `ruff`'s `target-version` were still pinned to
+  Python 3.13 after the Dockerfile base image moved to
+  `python:3.14-slim-bookworm`, so the unit suite was never actually run
+  under the interpreter the service deploys on. Bumped
+  `actions/setup-python`'s `python-version` and `[tool.ruff] target-version`
+  to `3.14`/`py314`; verified by running the full unit suite inside the real
+  built image under Python 3.14 (all 36 tests pass) rather than just the
+  host's 3.13 virtualenv.
 - `initialize()` (which runs `CREATE INDEX ... USING hnsw`) no longer shares
   the 10s per-request `statement_timeout`; schema application now uses its
   own 300s timeout, since an index build can legitimately take longer than
@@ -30,6 +38,11 @@
   updated with the tag). Verified with the full unit suite, a Docker build,
   and a live Compose deployment (health/ready, non-root/read-only-fs checks,
   and a real memory write + search round trip against Postgres/pgvector).
+- Bumped `pydantic-settings` 2.14.2 -> 2.15.0, `ruff` 0.16.1 -> 0.16.2, and
+  `httpx2` 2.9.1 -> 2.10.0 (patch-level, no code changes required). Verified
+  with the full unit suite, `ruff check`/`ruff format --check`, a Docker
+  build, and a full 21-check live Compose deployment run covering auth,
+  policy gating, write/search, scope isolation, and container hardening.
 
 ### Added
 
